@@ -1,0 +1,31 @@
+apply plugin: 'java'
+apply plugin: 'eclipse'
+
+group = 'xyz.funfan'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = 1.8
+
+repositories {
+	mavenCentral()
+	jcenter()
+}
+
+
+dependencies {
+	// compile ('org.apache.hadoop:hadoop-core:1.2.1') 
+	// compile (org.apache.hadoop:hadoop-mapreduce-client-core:2.9.2')
+	
+	compile fileTree(include: ['*.jar'], dir: 'libs') // windows only
+    	
+	testCompile 'junit:junit:4.12'
+}
+
+jar {
+    manifest {
+        attributes "Main-Class": "xyz.funfan.mr.flowsum.FlowSumDriver"
+    }
+     
+    from {
+        configurations.compile.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}
