@@ -200,6 +200,11 @@ public class FlowSumDriver extends Configured implements Tool {
 ```
 修改后，根据设置的文件切分上下限（这里是128MB），将输入文件切分成合适的大小
 
+## 分区
+
+实际上分区已经在第一个例子mr-wordcount里做过了，就是继承Partitioner类定义自己的分区方法；
+注意创建Driver类的时候，要制定Reduce Task的个数大于分区数，比如这里，至少要4个Task
+
 ## 排序
 
 map-reduce程序默认情况下会 使用字典排序，一般没什么业务需求的情况下，这也够了。
@@ -354,8 +359,277 @@ public class SortFlowSumReducer extends Reducer<FlowBean, Text, Text, FlowBean> 
 }
 
 ```
+## MR任务依赖
 
-## 分区
+有时一个mapreduce程序时完成不了的，往往需要多个mapreduce程序，这个时候就要牵扯到各个任务之间的依赖关系，所谓依赖就是一个M/R Job 的处理结果是另外的M/R 的输入。向这个例子中，为了给流量统计并排序，就需要执行两个MR程序：
 
-实际上分区已经在第一个例子mr-wordcount里做过了，就是继承Partitioner类定义自己的分区方法；
-注意创建Driver类的时候，要制定Reduce Task的个数大于分区数，比如这里，至少要4个Task
+1. 第一个MR程序按手机号累加流量，输出每个手机号的流量总和
+2. 第二个MR程序，将第一个MR程序的输出作为输入，并计算排序
+3. 最终得到排序过后的结果
+
+最笨的方法，我们当然可以等待Job1完成之后，自己新建一个新的Job2，读取Job1的结果来执行，像这样：
+
+```java
+
+package xyz.funfan.mr.flowsum;
+
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.CombineTextInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+import xyz.funfan.mr.flowsum.model.FlowBean;
+
+public class FlowSumDriver extends Configured implements Tool {
+
+	public static void main(String[] args) throws Exception {
+		int exitCode = ToolRunner.run(new FlowSumDriver(), args);
+        System.exit(exitCode);
+	}
+
+	@Override
+	public int run(String[] args) throws Exception {
+		if (args.length != 2) {
+			System.err.printf("Usage: %s needs two arguments, input and output files\n", getClass().getSimpleName());
+			return -1;
+		}
+	
+		// New Job
+		Job job = new Job();
+		job.setJarByClass(FlowSumDriver.class);
+		job.setJobName(getClass().getSimpleName());
+	
+		// Set Map-Reduce class
+		job.setMapperClass(FlowSumMapper.class);
+		job.setReducerClass(FlowSumReducer.class);
+		
+		// Set Reduce output format
+		job.setOutputKeyClass(Text.class);
+		job.setOutputValueClass(FlowBean.class);
+		
+		// Default inputFormat
+		// job.setInputFormatClass(TextInputFormat.class);
+		
+		// Combined Input format
+		job.setInputFormatClass(CombineTextInputFormat.class);
+		
+		// Customized input format
+		//job.setInputFormatClass(CompressedCombineFileInputFormat.class);
+		
+		FileInputFormat.setMaxInputSplitSize(job, 256 * 1024 * 1024);
+		FileInputFormat.setMinInputSplitSize(job, 128 * 1024 * 1024);	
+		
+		// Specified the input and output dir
+		FileInputFormat.setInputPaths(job, new Path(args[0]));
+		FileOutputFormat.setOutputPath(job, new Path(args[1]));
+	
+		int returnValue = job.waitForCompletion(true) ? 0:1;
+		
+		if(job.isSuccessful()) {
+			if (this.runSecond(args) == 0) {
+				System.out.println("Job was successful");
+			} else {
+				System.out.println("Job was failed");			
+			}
+		} else if(!job.isSuccessful()) {
+			System.out.println("Job was failed");			
+		}
+		
+		return returnValue;
+	}
+	
+	private int runSecond(String[] args) throws Exception {
+		if (args.length != 2) {
+			System.err.printf("Usage: %s needs two arguments, input and output files\n", getClass().getSimpleName());
+			return -1;
+		}
+	
+		// New Job
+		Job job = new Job();
+		job.setJarByClass(SortFlowSumDriver.class);
+		job.setJobName(getClass().getSimpleName());
+	
+		// Set Map-Reduce class
+		job.setMapperClass(SortFlowSumMapper.class);
+		job.setReducerClass(SortFlowSumReducer.class);
+		
+		// Set Reduce output format
+		job.setOutputKeyClass(FlowBean.class);
+		job.setOutputValueClass(Text.class);
+		
+		// Combined Input format
+		job.setInputFormatClass(CombineTextInputFormat.class);
+		FileInputFormat.setMaxInputSplitSize(job, 256 * 1024 * 1024);
+		FileInputFormat.setMinInputSplitSize(job, 128 * 1024 * 1024);
+		
+		// Combined Input format
+		job.setInputFormatClass(CombineTextInputFormat.class);
+		
+		// Specified the input and output dir
+		FileInputFormat.addInputPath(job, new Path(args[1] + "/part*"));
+		FileOutputFormat.setOutputPath(job, new Path(args[1] + "_sort"));
+	
+		int returnValue = job.waitForCompletion(true) ? 0:1;
+		
+		if(job.isSuccessful()) {
+			System.out.println("Sencondary Job was successful");
+		} else if(!job.isSuccessful()) {
+			System.out.println("Sencondary Job was failed");			
+		}
+		
+		return returnValue;
+	}
+}
+
+
+```
+
+如果想写的更优雅一点，或者为了能够适应更复杂的以来情况，
+Hadoop提供了任务控制容器ControlledJob，我们只要根据需要，在驱动类中加入ControlledJob 相关配置即可.
+相比于原来的驱动类：
+
+1. 和原来的驱动类一样，分别创建对应的MR Job
+2. 将为Job1， Job2分别创建对应的ControlledJob容器， ctrljobSum, ctrljobSort
+3.  通过 `ControlledJob.addDependingJob` 方法ctrljobSum, ctrljobSort配置依赖关系
+4. 创建主题JobControl，通过控制器 来控制ControlledJob
+5. 创建新线程，启动JobControl，通过`JobControl.getFailedJobList()`能够获取失败的任务
+
+```java
+package xyz.funfan.mr.flowsum;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.input.CombineTextInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
+import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+import xyz.funfan.mr.flowsum.model.FlowBean;
+
+public class FlowSumDriver extends Configured implements Tool {
+
+	public static void main(String[] args) throws Exception {
+		if (System.getProperty("os.name").startsWith("Windows")) {
+			System.setProperty("hadoop.home.dir", "D:\\Study\\hadoop\\hadoop-2.8.3");
+		}
+
+		int exitCode = ToolRunner.run(new FlowSumDriver(), args);
+        System.exit(exitCode);
+	}
+
+	@Override
+	public int run(String[] args) throws Exception {
+		if (args.length != 2) {
+			System.err.printf("Usage: %s needs two arguments, input and output files\n", getClass().getSimpleName());
+			return -1;
+		}
+		
+		Configuration conf = new Configuration();
+	
+		// 1. Init Job for Flow sum
+		Job flowSumJob = new Job(conf, "FlowSum");
+		flowSumJob.setJarByClass(FlowSumDriver.class);
+		flowSumJob.setJobName(getClass().getSimpleName());
+	
+		// Set Map-Reduce class
+		flowSumJob.setMapperClass(FlowSumMapper.class);
+		flowSumJob.setReducerClass(FlowSumReducer.class);
+		
+//		// Set partition
+//		job.setPartitionerClass(FlowSumPartitioner.class);
+//		job.setNumReduceTasks(5);
+		
+		// Set Reduce output format
+		flowSumJob.setOutputKeyClass(Text.class);
+		flowSumJob.setOutputValueClass(FlowBean.class);
+		
+		// Default inputFormat
+		// job.setInputFormatClass(TextInputFormat.class);
+		
+		// Combined Input format
+		flowSumJob.setInputFormatClass(CombineTextInputFormat.class);
+		
+		// Customized input format
+		//job.setInputFormatClass(CompressedCombineFileInputFormat.class);
+		
+		FileInputFormat.setMaxInputSplitSize(flowSumJob, 256 * 1024 * 1024);
+		FileInputFormat.setMinInputSplitSize(flowSumJob, 128 * 1024 * 1024);
+		// Specified the input and output dir
+		FileInputFormat.addInputPath(flowSumJob, new Path(args[0]));
+		FileOutputFormat.setOutputPath(flowSumJob, new Path(args[1]));
+		
+		// int returnValue = flowSumJob.waitForCompletion(true) ? 0:1;
+		
+		// new ControlledJob for first job
+        ControlledJob ctrljobSum = new ControlledJob(conf);   
+        ctrljobSum.setJob(flowSumJob);   
+        
+		// 2. Init second job for flow sort
+        Job flowSortJob = new Job(conf, "FlowSort");
+ 		flowSortJob.setJarByClass(FlowSumDriver.class);
+ 		flowSortJob.setJobName(getClass().getSimpleName());
+	
+		// Set Map-Reduce class
+ 		flowSortJob.setMapperClass(SortFlowSumMapper.class);
+ 		flowSortJob.setReducerClass(SortFlowSumReducer.class);
+		
+		// Set Reduce output format
+ 		flowSortJob.setOutputKeyClass(FlowBean.class);
+ 		flowSortJob.setOutputValueClass(Text.class);
+		
+		// Combined Input format
+ 		flowSortJob.setInputFormatClass(CombineTextInputFormat.class);
+		
+		FileInputFormat.setMaxInputSplitSize(flowSortJob, 256 * 1024 * 1024);
+		FileInputFormat.setMinInputSplitSize(flowSortJob, 128 * 1024 * 1024);
+		// The input should be the output of flowSumJob
+		FileInputFormat.addInputPath(flowSortJob, new Path(args[1]));
+		FileOutputFormat.setOutputPath(flowSortJob, new Path(args[1] + "_sorted"));
+		
+		// int returnValue = flowSortJob.waitForCompletion(true) ? 0:1;
+		
+		ControlledJob ctrljobSort = new ControlledJob(conf);   
+		ctrljobSort.setJob(flowSortJob);   
+		
+		// 3. Add dependencies
+		ctrljobSort.addDependingJob(ctrljobSum);   
+		
+		// 4. Create main job controller
+        JobControl jobCtrl = new JobControl("flowController");   
+      
+        // add dependencies and 
+        jobCtrl.addJob(ctrljobSum);   
+        jobCtrl.addJob(ctrljobSort);   
+  
+        // 5. Start Jobs in a new thread
+        Thread runJobControl = new Thread(jobCtrl);
+        runJobControl.start();
+        
+        while (true) {
+        	if (jobCtrl.allFinished()) {
+        		int returnValue = jobCtrl.getFailedJobList().size() == 0 ? 0 : 1;
+        		if (returnValue == 0) {
+        			System.out.println("Job was successful");
+        		} else {
+        			System.out.println("Job was failed");
+        		}
+        		return returnValue;
+        	} else {
+        		Thread.sleep(1000);
+        	}
+        }
+	}
+}
+
+```
